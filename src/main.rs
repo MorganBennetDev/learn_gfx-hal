@@ -4,9 +4,66 @@ use gfx_hal::{
     Instance,
 };
 use shaderc::ShaderKind;
+use std::iter::{empty, once};
+use std::mem::ManuallyDrop;
 
-const APP_NAME: &'static str = "Part 1: Drawing a triangle";
+const APP_NAME: &'static str = "Part 2: Push constants";
 const WINDOW_SIZE: [u32; 2] = [512, 512];
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct PushConstants {
+    color: [f32; 4],
+    pos: [f32; 2],
+    scale: [f32; 2],
+}
+
+struct Resources<B: gfx_hal::Backend> {
+    instance: B::Instance,
+    surface: B::Surface,
+    device: B::Device,
+    render_passes: Vec<B::RenderPass>,
+    pipeline_layouts: Vec<B::PipelineLayout>,
+    pipelines: Vec<B::GraphicsPipeline>,
+    command_pool: B::CommandPool,
+    submission_complete_fence: B::Fence,
+    rendering_complete_semaphore: B::Semaphore,
+}
+
+struct ResourceHolder<B: gfx_hal::Backend>(ManuallyDrop<Resources<B>>);
+
+impl<B: gfx_hal::Backend> Drop for ResourceHolder<B> {
+    fn drop(&mut self) {
+        unsafe {
+            let Resources {
+                instance,
+                mut surface,
+                device,
+                command_pool,
+                render_passes,
+                pipeline_layouts,
+                pipelines,
+                submission_complete_fence,
+                rendering_complete_semaphore,
+            } = ManuallyDrop::take(&mut self.0);
+
+            device.destroy_semaphore(rendering_complete_semaphore);
+            device.destroy_fence(submission_complete_fence);
+            for pipeline in pipelines {
+                device.destroy_graphics_pipeline(pipeline);
+            }
+            for pipeline_layout in pipeline_layouts {
+                device.destroy_pipeline_layout(pipeline_layout);
+            }
+            for render_pass in render_passes {
+                device.destroy_render_pass(render_pass);
+            }
+            device.destroy_command_pool(command_pool);
+            surface.unconfigure_swapchain(&device);
+            instance.destroy_surface(surface);
+        }
+    }
+}
 
 /// Compile some GLSL shader source to SPIR-V.
 fn compile_shader(glsl: &str, shader_kind: ShaderKind) -> Vec<u32> {
@@ -19,10 +76,85 @@ fn compile_shader(glsl: &str, shader_kind: ShaderKind) -> Vec<u32> {
     compiled_shader.as_binary().to_vec()
 }
 
-fn main() {
-    use std::iter::{empty, once};
-    use std::mem::ManuallyDrop;
+unsafe fn make_pipeline<B: gfx_hal::Backend>(
+    device: &B::Device,
+    render_pass: &B::RenderPass,
+    pipeline_layout: &B::PipelineLayout,
+    vertex_shader: &str,
+    fragment_shader: &str,
+) -> B::GraphicsPipeline {
+    use gfx_hal::pass::Subpass;
+    use gfx_hal::pso::{
+        BlendState, ColorBlendDesc, ColorMask, EntryPoint, Face, GraphicsPipelineDesc,
+        InputAssemblerDesc, Primitive, PrimitiveAssemblerDesc, Rasterizer, Specialization,
+    };
+    let vertex_shader_module = device
+        .create_shader_module(&compile_shader(vertex_shader, ShaderKind::Vertex))
+        .expect("Failed to create vertex shader module");
 
+    let fragment_shader_module = device
+        .create_shader_module(&compile_shader(fragment_shader, ShaderKind::Fragment))
+        .expect("Failed to create fragment shader module");
+
+    let (vs_entry, fs_entry) = (
+        EntryPoint {
+            entry: "main",
+            module: &vertex_shader_module,
+            specialization: Specialization::default(),
+        },
+        EntryPoint {
+            entry: "main",
+            module: &fragment_shader_module,
+            specialization: Specialization::default(),
+        },
+    );
+
+    let primitive_assembler = PrimitiveAssemblerDesc::Vertex {
+        buffers: &[],
+        attributes: &[],
+        input_assembler: InputAssemblerDesc::new(Primitive::TriangleList),
+        vertex: vs_entry,
+        tessellation: None,
+        geometry: None,
+    };
+
+    let mut pipeline_desc = GraphicsPipelineDesc::new(
+        primitive_assembler,
+        Rasterizer {
+            cull_face: Face::BACK,
+            ..Rasterizer::FILL
+        },
+        Some(fs_entry),
+        pipeline_layout,
+        Subpass {
+            index: 0,
+            main_pass: render_pass,
+        },
+    );
+
+    pipeline_desc.blender.targets.push(ColorBlendDesc {
+        mask: ColorMask::ALL,
+        blend: Some(BlendState::ALPHA),
+    });
+
+    let pipeline = device
+        .create_graphics_pipeline(&pipeline_desc, None)
+        .expect("Failed to create graphics pipeline");
+
+    device.destroy_shader_module(vertex_shader_module);
+    device.destroy_shader_module(fragment_shader_module);
+
+    return pipeline
+}
+
+unsafe fn push_constant_bytes<T>(push_constants: &T) -> &[u32] {
+    let size_in_bytes = std::mem::size_of::<T>();
+    let size_in_u32s = size_in_bytes / std::mem::size_of::<u32>();
+    let start_ptr = push_constants as *const T as *const u32;
+    std::slice::from_raw_parts(start_ptr, size_in_u32s)
+}
+
+fn main() {
     let event_loop = winit::event_loop::EventLoop::new();
 
     let (logical_window_size, physical_window_size) = {
@@ -153,85 +285,23 @@ fn main() {
     };
 
     let pipeline_layout = unsafe {
+        use gfx_hal::pso::ShaderStageFlags;
+
+        let push_constant_bytes = std::mem::size_of::<PushConstants>() as u32;
+
         device
-            .create_pipeline_layout(empty(), empty())
+            .create_pipeline_layout(
+                empty(),
+                once((ShaderStageFlags::VERTEX, 0..push_constant_bytes)),
+            )
             .expect("Out of memory")
     };
 
-    let vertex_shader = include_str!("shaders/part-1.vert");
-    let fragment_shader = include_str!("shaders/part-1.frag");
-
-    unsafe fn make_pipeline<B: gfx_hal::Backend>(
-        device: &B::Device,
-        render_pass: &B::RenderPass,
-        pipeline_layout: &B::PipelineLayout,
-        vertex_shader: &str,
-        fragment_shader: &str,
-    ) -> B::GraphicsPipeline {
-        use gfx_hal::pass::Subpass;
-        use gfx_hal::pso::{
-            BlendState, ColorBlendDesc, ColorMask, EntryPoint, Face, GraphicsPipelineDesc,
-            InputAssemblerDesc, Primitive, PrimitiveAssemblerDesc, Rasterizer, Specialization,
-        };
-        let vertex_shader_module = device
-            .create_shader_module(&compile_shader(vertex_shader, ShaderKind::Vertex))
-            .expect("Failed to create vertex shader module");
-
-        let fragment_shader_module = device
-            .create_shader_module(&compile_shader(fragment_shader, ShaderKind::Fragment))
-            .expect("Failed to create fragment shader module");
-
-        let (vs_entry, fs_entry) = (
-            EntryPoint {
-                entry: "main",
-                module: &vertex_shader_module,
-                specialization: Specialization::default(),
-            },
-            EntryPoint {
-                entry: "main",
-                module: &fragment_shader_module,
-                specialization: Specialization::default(),
-            },
-        );
-
-        let primitive_assembler = PrimitiveAssemblerDesc::Vertex {
-            buffers: &[],
-            attributes: &[],
-            input_assembler: InputAssemblerDesc::new(Primitive::TriangleList),
-            vertex: vs_entry,
-            tessellation: None,
-            geometry: None,
-        };
-
-        let mut pipeline_desc = GraphicsPipelineDesc::new(
-            primitive_assembler,
-            Rasterizer {
-                cull_face: Face::BACK,
-                ..Rasterizer::FILL
-            },
-            Some(fs_entry),
-            pipeline_layout,
-            Subpass {
-                index: 0,
-                main_pass: render_pass,
-            },
-        );
-
-        pipeline_desc.blender.targets.push(ColorBlendDesc {
-            mask: ColorMask::ALL,
-            blend: Some(BlendState::ALPHA),
-        });
-
-        let pipeline = device
-            .create_graphics_pipeline(&pipeline_desc, None)
-            .expect("Failed to create graphics pipeline");
-
-        device.destroy_shader_module(vertex_shader_module);
-        device.destroy_shader_module(fragment_shader_module);
-
-        return pipeline
-    }
     
+
+    let vertex_shader = include_str!("shaders/part-2.vert");
+    let fragment_shader = include_str!("shaders/part-2.frag");
+
     let pipeline = unsafe {
         make_pipeline::<backend::Backend>(
             &device,
@@ -245,53 +315,6 @@ fn main() {
     let submission_complete_fence = device.create_fence(true).expect("Out of memory");
     let rendering_complete_semaphore = device.create_semaphore().expect("Out of memory");
 
-    struct Resources<B: gfx_hal::Backend> {
-        instance: B::Instance,
-        surface: B::Surface,
-        device: B::Device,
-        render_passes: Vec<B::RenderPass>,
-        pipeline_layouts: Vec<B::PipelineLayout>,
-        pipelines: Vec<B::GraphicsPipeline>,
-        command_pool: B::CommandPool,
-        submission_complete_fence: B::Fence,
-        rendering_complete_semaphore: B::Semaphore,
-    }
-
-    struct ResourceHolder<B: gfx_hal::Backend>(ManuallyDrop<Resources<B>>);
-
-    impl<B: gfx_hal::Backend> Drop for ResourceHolder<B> {
-        fn drop(&mut self) {
-            unsafe {
-                let Resources {
-                    instance,
-                    mut surface,
-                    device,
-                    command_pool,
-                    render_passes,
-                    pipeline_layouts,
-                    pipelines,
-                    submission_complete_fence,
-                    rendering_complete_semaphore,
-                } = ManuallyDrop::take(&mut self.0);
-
-                device.destroy_semaphore(rendering_complete_semaphore);
-                device.destroy_fence(submission_complete_fence);
-                for pipeline in pipelines {
-                    device.destroy_graphics_pipeline(pipeline);
-                }
-                for pipeline_layout in pipeline_layouts {
-                    device.destroy_pipeline_layout(pipeline_layout);
-                }
-                for render_pass in render_passes {
-                    device.destroy_render_pass(render_pass);
-                }
-                device.destroy_command_pool(command_pool);
-                surface.unconfigure_swapchain(&device);
-                instance.destroy_surface(surface);
-            }
-        }
-    }
-
     let mut resource_holder: ResourceHolder<backend::Backend> =
         ResourceHolder(ManuallyDrop::new(Resources {
             instance,
@@ -304,7 +327,9 @@ fn main() {
             submission_complete_fence,
             rendering_complete_semaphore,
         }));
+    
 
+    let start_time = std::time::Instant::now();
     // Note that this takes a `move` closure. This means it will take ownership
     // over any resources referenced within. It also means they will be dropped
     // only when the application is quit.
@@ -335,7 +360,51 @@ fn main() {
             Event::RedrawRequested(_) => {
                 let res: &mut Resources<_> = &mut resource_holder.0;
                 let render_pass = &res.render_passes[0];
+                let pipeline_layout = &res.pipeline_layouts[0];
                 let pipeline = &res.pipelines[0];
+
+                let anim = start_time.elapsed().as_secs_f32().sin() * 0.5 + 0.5;
+
+                let small = [0.33, 0.33];
+
+                let triangles = &[
+                    // Red triangle
+                    PushConstants {
+                        color: [1.0, 0.0, 0.0, 1.0],
+                        pos: [-0.5, -0.5],
+                        scale: small,
+                    },
+                    // Green triangle
+                    PushConstants {
+                        color: [0.0, 1.0, 0.0, 1.0],
+                        pos: [0.0, -0.5],
+                        scale: small,
+                    },
+                    // Blue triangle
+                    PushConstants {
+                        color: [0.0, 0.0, 1.0, 1.0],
+                        pos: [0.5, -0.5],
+                        scale: small,
+                    },
+                    // Blue <-> cyan animated triangle
+                    PushConstants {
+                        color: [0.0, anim, 1.0, 1.0],
+                        pos: [-0.5, 0.5],
+                        scale: small,
+                    },
+                    // Down <-> up animated triangle
+                    PushConstants {
+                        color: [1.0, 1.0, 1.0, 1.0],
+                        pos: [0.0, 0.5 - anim * 0.5],
+                        scale: small,
+                    },
+                    // Small <-> big animated triangle
+                    PushConstants {
+                        color: [1.0, 1.0, 1.0, 1.0],
+                        pos: [0.5, 0.5],
+                        scale: [0.33 + anim * 0.33, 0.33 + anim * 0.33],
+                    },
+                ];
 
                 unsafe {
                     use gfx_hal::pool::CommandPool;
@@ -455,7 +524,18 @@ fn main() {
 
                     command_buffer.bind_graphics_pipeline(pipeline);
 
-                    command_buffer.draw(0..3, 0..1);
+                    for triangle in triangles {
+                        use gfx_hal::pso::ShaderStageFlags;
+
+                        command_buffer.push_graphics_constants(
+                            pipeline_layout,
+                            ShaderStageFlags::VERTEX,
+                            0,
+                            push_constant_bytes(triangle),
+                        );
+
+                        command_buffer.draw(0..3, 0..1);
+                    }
 
                     command_buffer.end_render_pass();
                     command_buffer.finish();
